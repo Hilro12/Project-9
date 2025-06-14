@@ -1,0 +1,280 @@
+import torch
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from model import create_resnet50, create_feature_vae, ResNetFeatureExtractor, vae_loss
+from DataLoader import Create_DataLoader
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+def extract_all_features(model, feature_extractor, dataloader, device):
+    “”“Extracts ALL features quickly”“”
+    model.eval()
+    features_list = []
+
+    with torch.no_grad():
+        for images, _ in tqdm(dataloader, desc="🔍 Feature Extraction", ncols=80):
+            images = images.to(device)
+            features = feature_extractor.get_features(images)
+            features_list.append(features.cpu())
+
+    return torch.cat(features_list, dim=0)
+
+
+def beta_annealing(epoch, max_epochs, start_beta=0.0, end_beta=1.0):
+    “”“Beta annealing: start low for focus on reconstruction”“”
+    if epoch < max_epochs * 0.3:  # First 30% reconstruction only
+        return start_beta
+    else:
+        progress = (epoch - max_epochs * 0.3) / (max_epochs * 0.7)
+        return start_beta + (end_beta - start_beta) * min(progress, 1.0)
+
+
+def train_vae_military(vae, features, optimizer, scheduler, epoch, device, beta, batch_size=512):
+# aggressive train
+    vae.train()
+    total_loss = 0
+    total_recon = 0
+    total_kl = 0
+
+    # Shuffle
+    indices = torch.randperm(features.size(0))
+    features = features[indices]
+
+    num_batches = len(features) // batch_size
+
+    with tqdm(range(num_batches), desc=f"🪖 Epoch {epoch}", ncols=80, leave=False) as pbar:
+        for i in pbar:
+            batch_features = features[i * batch_size:(i + 1) * batch_size].to(device)
+
+            optimizer.zero_grad()
+            recon_features, mu, logvar = vae(batch_features)
+            loss, recon_loss, kl_loss = vae_loss(recon_features, batch_features, mu, logvar, beta)
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(vae.parameters(), max_norm=1.0)  # Gradient clipping
+            optimizer.step()
+
+            total_loss += loss.item()
+            total_recon += recon_loss.item()
+            total_kl += kl_loss.item()
+
+            # Update progress
+            pbar.set_postfix({
+                'Loss': f'{loss.item():.3f}',
+                'β': f'{beta:.3f}'
+            })
+
+    scheduler.step()
+
+    return total_loss / num_batches, total_recon / num_batches, total_kl / num_batches
+
+#function that takes all errors from validation and calculates the threshold, which we will then use for actual ood detection
+def evaluate_vae_precision(vae, features, device, batch_size=512):
+    #threshold calculation
+    vae.eval()
+    all_errors = []
+
+    with torch.no_grad():
+        num_batches = len(features) // batch_size
+        for i in range(num_batches):
+            batch_features = features[i * batch_size:(i + 1) * batch_size].to(device)
+            errors = vae.reconstruction_error(batch_features)
+            all_errors.append(errors.cpu())
+
+    # Concatenate all errors
+    all_errors = torch.cat(all_errors, dim=0)
+
+    # I chose the 95% threshold, I basically place the threshold at the 95% position in the vector with the errors
+    #telling precisely that if the error is above then it is ood, if below then id
+    avg_error = all_errors.mean().item()
+    threshold_95 = torch.quantile(all_errors, 0.95).item()  # 95° percentile
+
+    return avg_error, threshold_95, all_errors
+
+
+def plot_military_results(losses, recon_losses, kl_losses, val_errors, thresholds, betas):
+    “”“Plot results battle with threshold”“”
+    epochs = range(1, len(losses) + 1)
+
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+
+    # Total Loss
+    ax1.plot(epochs, losses, 'r-', linewidth=2, alpha=0.8)
+    ax1.set_title('🔥 Total VAE Loss', fontweight='bold')
+    ax1.set_ylabel('Loss')
+    ax1.grid(True, alpha=0.3)
+
+    # Reconstruction vs KL
+    ax2.plot(epochs, recon_losses, 'b-', label='Reconstruction', linewidth=2)
+    ax2.plot(epochs, kl_losses, 'g-', label='KL Divergence', linewidth=2)
+    ax2.set_title('⚔️ Reconstruction vs KL', fontweight='bold')
+    ax2.set_ylabel('Loss')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    # Validation Error + Threshold
+    ax3.plot(epochs, val_errors, 'orange', linewidth=2, label='Avg Error')
+    ax3.plot(epochs, thresholds, 'red', linewidth=2, linestyle='--', label='Threshold (95%)')
+    ax3.set_title('🎯 Validation Error vs Threshold', fontweight='bold')
+    ax3.set_xlabel('Epoch')
+    ax3.set_ylabel('Reconstruction Error')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+
+    # Beta Annealing
+    ax4.plot(epochs, betas, 'm-', linewidth=2)
+    ax4.set_title('📈 Beta Annealing', fontweight='bold')
+    ax4.set_xlabel('Epoch')
+    ax4.set_ylabel('Beta Value')
+    ax4.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig('vae_military_training.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+
+def main():
+    FOOD101_ROOT = r"C:\Users\Mattia\Desktop\PROGETTO_COMPUTER_VISION\FOOD_101\food-101\food-101"
+    SVHN_ROOT = r"C:\Users\Mattia\Desktop\PROGETTO_COMPUTER_VISION\SVHN"
+    RESNET_PATH = r"C:\Users\Mattia\Desktop\PROGETTO_COMPUTER_VISION\SGD\resnet50_food101.pth"
+    VAE_SAVE_PATH = "feature_vae_military.pth"
+
+    # BRUTAL PARAMETERS
+    NUM_EPOCHS = 120  
+    LEARNING_RATE = 0.001
+    BATCH_SIZE = 512  # Larger batches for stability
+    LATENT_DIM = 256
+    PATIENCE = 15  # Early stopping patience
+
+    print(" VAE TRAINING ")
+    print("=" * 60)
+
+    # =================== UPLOADING DATA ===================
+    train_loader, val_loader, _, _ = Create_DataLoader(
+        food101_root=FOOD101_ROOT,
+        svhn_root=SVHN_ROOT,
+        batch_size=64,  # By feature extraction
+        num_workers=0
+    )
+
+    # Charge ResNet50
+    print("📥 Loading ResNet50...")
+    resnet_model = create_resnet50(num_classes=101).to(device)
+    checkpoint = torch.load(RESNET_PATH, map_location=device)
+    resnet_model.load_state_dict(checkpoint['model_state_dict'])
+    resnet_model.eval()
+
+    feature_extractor = ResNetFeatureExtractor(resnet_model)
+
+    # Extract feature
+    print("⚡ Extracting Training Features...")
+    train_features = extract_all_features(resnet_model, feature_extractor, train_loader, device)
+    print("⚡ Extracting Validation Features...")
+    val_features = extract_all_features(resnet_model, feature_extractor, val_loader, device)
+
+    print(f"🎯 Training Features: {train_features.shape}")
+    print(f"🎯 Validation Features: {val_features.shape}")
+
+    # =================== VAE  SETUP ===================
+    vae = create_feature_vae(latent_dim=LATENT_DIM).to(device)
+    optimizer = optim.AdamW(vae.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
+
+    # Learning rate scheduler aggressivo
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=20, T_mult=2, eta_min=1e-6
+    )
+
+    print(f" Training: {NUM_EPOCHS} epochs")
+    print(f"Batch Size: {BATCH_SIZE}")
+    print(f"Latent Dim: {LATENT_DIM}")
+    print("=" * 60)
+
+    # =================== TRACKING ===================
+    losses, recon_losses, kl_losses, val_errors, thresholds, betas = [], [], [], [], [], []
+    best_val_error = float('inf')
+    best_threshold = None
+    patience_counter = 0
+
+    # =================== TRAINING  ===================
+    for epoch in range(1, NUM_EPOCHS + 1):
+
+        # Beta annealing strategy
+        beta = beta_annealing(epoch, NUM_EPOCHS)
+        betas.append(beta)
+
+        # Training
+        avg_loss, avg_recon, avg_kl = train_vae_military(
+            vae, train_features, optimizer, scheduler, epoch, device, beta, BATCH_SIZE
+        )
+
+        # Convalida con calcolo della soglia
+        val_error, threshold_95, _ = evaluate_vae_precision(vae, val_features, device, BATCH_SIZE)
+
+        # Tracking
+        losses.append(avg_loss)
+        recon_losses.append(avg_recon)
+        kl_losses.append(avg_kl)
+        val_errors.append(val_error)
+        thresholds.append(threshold_95)
+
+        # Report each 10 epochs
+        if epoch % 10 == 0 or epoch <= 5:
+            lr = optimizer.param_groups[0]['lr']
+            print(f"📊 Epoch {epoch:3d} | Loss: {avg_loss:.4f} | Recon: {avg_recon:.4f} | "
+                  f"KL: {avg_kl:.4f} | Val: {val_error:.4f} | Thr: {threshold_95:.4f} | β: {beta:.3f} | LR: {lr:.2e}")
+
+        # Early stopping with the best model
+        if val_error < best_val_error:
+            best_val_error = val_error
+            best_threshold = threshold_95
+            patience_counter = 0
+
+            # save the best model
+            torch.save({
+                'epoch': epoch,
+                'vae_state_dict': vae.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_val_error': best_val_error,
+                'best_threshold': best_threshold,  # ← SAVE THE THRESHOLD!
+                'latent_dim': LATENT_DIM,
+                'training_history': {
+                    'losses': losses,
+                    'recon_losses': recon_losses,
+                    'kl_losses': kl_losses,
+                    'val_errors': val_errors,
+                    'thresholds': thresholds,
+                    'betas': betas
+                }
+            }, VAE_SAVE_PATH)
+
+            if epoch % 10 == 0:
+                print(f"💾 New best model saved! Val Error: {best_val_error:.4f} | Threshold: {best_threshold:.4f}")
+        else:
+            patience_counter += 1
+
+        # Early stopping
+        if patience_counter >= PATIENCE:
+            print(f"Early stopping at epoch {epoch}. Best val error: {best_val_error:.4f}")
+            break
+
+    # =================== MISSION COMPLETE ===================
+    print("\n" + "=" * 60)
+    print("TRAINING COMPLETE!")
+    print(f"Best Validation Error: {best_val_error:.4f}")
+    print(f"OOD Detection Threshold: {best_threshold:.4f}")
+    print(f"Total Epochs: {epoch}")
+    print(f"Model saved: {VAE_SAVE_PATH}")
+
+    # Final Report
+    plot_military_results(losses, recon_losses, kl_losses, val_errors, thresholds, betas)
+
+    print("\nVAE is now a FOOD FEATURE EXPERT!")
+    print(f"Use threshold {best_threshold:.4f} for OOD detection:")
+    print(" Error < threshold = Food (In-Distribution)")
+    print(" Error > threshold = Not Food (Out-of-Distribution)")
+
+
+if __name__ == "__main__":
+    main()
