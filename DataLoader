@@ -64,7 +64,7 @@ def split_train_dataset(dataset, validation_split=0.1):
     print("Analysis of classes in the dataset...")
     class_indices = {}
 
-    for i in tqdm(range(len(dataset)), desc="Raccolta etichette", unit="img"):
+    for i in tqdm(range(len(dataset)), desc="Label collection", unit="img"):
         _, label = dataset[i]
         if label not in class_indices:
             class_indices[label] = []
@@ -75,7 +75,7 @@ def split_train_dataset(dataset, validation_split=0.1):
     val_indices = []
 
     # Show a progress bar for layering.
-    for label, indices in tqdm(class_indices.items(), desc="Class stratification", unit="classe"):
+    for label, indices in tqdm(class_indices.items(), desc="Class stratification", unit="class"):
         # Shuffle the indexes of this class
         indices = torch.tensor(indices)[torch.randperm(len(indices))]
 
