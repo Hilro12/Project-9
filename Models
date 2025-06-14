@@ -1,0 +1,218 @@
+import torch
+import torch.nn as nn
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+#define the number of parameters for a resnet50 network.
+model_parameters = {'resnet50': ([64, 128, 256, 512], [3, 4, 6, 3], 4, True)}
+
+#I have to create the bottleneck class now.
+
+class Bottleneck(nn.Module):
+    def __init__(self,in_channels,intermediate_channels,expansion,stride):
+
+        super(Bottleneck, self).__init__()
+
+        self.expansion = expansion
+        self.in_channels = in_channels
+        self.intermediate_channels = intermediate_channels
+
+        #need to check if input and output channels are the same for each block, spoiler: always need to first block
+        #needs to see if I can do a direct skip connection or I need projection
+        if self.in_channels == self.intermediate_channels*expansion:
+            self.identity = True
+        else:
+            #simply create a 1x1 convolutional layer that is used to adjust the channel number
+            self.identity = False
+            self.projection = nn.Sequential(
+                nn.Conv2d(in_channels=self.in_channels, out_channels=self.intermediate_channels * self.expansion,
+                          kernel_size=1, stride=stride, padding=0, bias=False),
+                nn.BatchNorm2d(self.intermediate_channels * self.expansion)
+            )
+
+        self.relu = nn.ReLU()
+        #defining the bottleneck strategy.
+        # 1x1
+        self.conv1_1x1 = nn.Conv2d(in_channels=self.in_channels, out_channels=self.intermediate_channels,
+                                           kernel_size=1, stride=1, padding=0, bias=False)
+        self.batchnorm1 = nn.BatchNorm2d(self.intermediate_channels)
+        # 3x3
+        self.conv2_3x3 = nn.Conv2d(in_channels=self.intermediate_channels,
+                                           out_channels=self.intermediate_channels, kernel_size=3, stride=stride,
+                                           padding=1, bias=False)
+        self.batchnorm2 = nn.BatchNorm2d(self.intermediate_channels)
+        # 1x1
+        self.conv3_1x1 = nn.Conv2d(in_channels=self.intermediate_channels,
+                                           out_channels=self.intermediate_channels * self.expansion, kernel_size=1,
+                                           stride=1, padding=0, bias=False)
+        self.batchnorm3 = nn.BatchNorm2d(self.intermediate_channels * self.expansion)
+
+    def forward(self, x):
+        in_x = x #per la skip_connection
+
+        # conv1x1->BN->relu
+        x = self.relu(self.batchnorm1(self.conv1_1x1(x)))
+        # conv3x3->BN->relu
+        x = self.relu(self.batchnorm2(self.conv2_3x3(x)))
+        # conv1x1->BN
+        x = self.batchnorm3(self.conv3_1x1(x))
+
+        #skip connection
+        if self.identity:
+            x += in_x
+        else:
+            x += self.projection(in_x)
+
+        # final relu
+        x = self.relu(x)
+        return x
+
+#define renet50 network now.
+class ResNet(nn.Module):
+    def __init__(self, resnet_variant, in_channels, num_classes):
+        super(ResNet, self).__init__()
+        self.channels_list = resnet_variant[0]
+        self.repeatition_list = resnet_variant[1]
+        self.expansion = resnet_variant[2]
+
+        self.conv1 = nn.Conv2d(in_channels=in_channels, out_channels=64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.batchnorm1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU()
+
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        self.block1 = self._make_blocks(64, self.channels_list[0], self.repeatition_list[0], self.expansion, stride=1)
+        self.block2 = self._make_blocks(self.channels_list[0] * self.expansion, self.channels_list[1],
+                                        self.repeatition_list[1], self.expansion, stride=2)
+        self.block3 = self._make_blocks(self.channels_list[1] * self.expansion, self.channels_list[2],
+                                        self.repeatition_list[2], self.expansion, stride=2)
+        self.block4 = self._make_blocks(self.channels_list[2] * self.expansion, self.channels_list[3],
+                                        self.repeatition_list[3], self.expansion, stride=2)
+        self.average_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Linear(self.channels_list[3] * self.expansion, num_classes)
+
+    def forward(self, x):
+        x = self.relu(self.batchnorm1(self.conv1(x)))
+        x = self.maxpool(x)
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.block4(x)
+        x = self.average_pool(x)
+        x = torch.flatten(x, start_dim=1)
+        x = self.fc1(x)
+        return x
+
+    #create a sequence of bottleneck blocks to form a resnet stage.
+    def _make_blocks(self, in_channels, intermediate_channels, num_repeat, expansion, stride):
+        layers = []
+        layers.append(Bottleneck(in_channels, intermediate_channels, expansion, stride=stride))
+        for num in range(1, num_repeat):
+            layers.append(Bottleneck(intermediate_channels * expansion, intermediate_channels, expansion,stride=1))
+        return nn.Sequential(*layers)
+
+
+#---------------------------------- Variational auto encoder -----------------------------------------
+
+#start by defining a class that will extract the vector from the resnet before it is sent to the fully connected layers for classification
+
+class ResNetFeatureExtractor:
+    def __init__(self, resnet_model):
+        self.model = resnet_model
+
+    #function that actually extracts features
+    def get_features(self, x):
+        x = self.model.relu(self.model.batchnorm1(self.model.conv1(x)))
+        x = self.model.maxpool(x)
+        x = self.model.block1(x)  # [B, 64, 56, 56] → [B, 256, 56, 56]
+        x = self.model.block2(x)  # [B, 256, 56, 56] → [B, 512, 28, 28]
+        x = self.model.block3(x)  # [B, 512, 28, 28] → [B, 1024, 14, 14]
+        #x = self.model.block4(x)  # [B, 1024, 14, 14] → [B, 2048, 7, 7]
+        x = self.model.average_pool(x)
+        #I'll stop here, otherwise I would also take the fc layer data that we don't want.
+        features = torch.flatten(x, start_dim=1)  # [batch_size, 1024] I got the vector to send to vae :)
+        return features
+
+
+#define now the vae for real
+class FeatureVAE(nn.Module):
+    def __init__(self, feature_dim=1024,latent_dim=256):
+        super(FeatureVAE, self).__init__()
+        self.feature_dim = feature_dim
+        self.latent_dim = latent_dim
+
+        #declare encoder
+        self.encoder = nn.Sequential(
+            nn.Linear(feature_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),#helps to avoid overfitting
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, latent_dim * 2),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, feature_dim),
+        )
+    def encode(self,x):
+        #must return mu and logvar, which is why I multiply by 2
+        h = self.encoder(x)
+        mu, logvar = torch.chunk(h, 2, dim=-1)
+        return mu, logvar
+    def reparameterize(self, mu, logvar):
+        #does the standad deviation of the log variance
+        std = torch.exp(0.5*logvar)
+        #generates random noise
+        eps = torch.randn_like(std)
+        #return parameter reparameterized
+        return mu + eps*std
+    def decode(self, z):
+        h = self.decoder(z)
+        return h
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        recon_x = self.decode(z)
+        return recon_x, mu, logvar
+    def reconstruction_error(self, x):
+        “”“Calculate reconstruction error (for OOD detection)‘’”"
+        with torch.no_grad():
+            recon_x, _, _ = self.forward(x)
+            # MSE between input and reconstruction
+            mse = torch.mean((x - recon_x) ** 2, dim=1)
+            return mse
+
+#-------------------------------- I define the loss functions -----------------------------------
+
+def vae_loss(recon_x, x, mu, logvar, beta=1.0):
+    """
+    Loss function for the VAE
+    Args:
+        recon_x: feature ricostruite
+        x: feature originali
+        mu, logvar: parameters of latent distribution
+        beta: weight for KL divergence (beta-VAE)
+    """
+    # Reconstruction loss (MSE)
+    recon_loss = nn.functional.mse_loss(recon_x, x, reduction='sum')
+    # KL divergence loss
+    kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    total_loss = recon_loss + beta * kl_loss
+    return total_loss, recon_loss, kl_loss
+
+
+
+# --------------------------- UTILITY FUNCTIONS ---------------------------------------
+def create_resnet50(num_classes=101):
+    """Create ResNet50 for Food-101"""
+    resnet_variant = model_parameters['resnet50']
+    return ResNet(resnet_variant, in_channels=3, num_classes=num_classes)
+
+def create_feature_vae(latent_dim=256):
+    """Crea VAE per feature 2048D"""
+    return FeatureVAE(feature_dim=1024, latent_dim=latent_dim)
