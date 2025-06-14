@@ -3,7 +3,7 @@ from torch.utils.data import Dataset
 from torchvision.io import read_image
 import torchvision
 
-#dichiaro la classe per il dataset Food-101
+#state the class for the Food-101 dataset.
 class Food101Dataset(Dataset):
     def __init__(self, root, split="train",transform=None, target_transform=None):
 
