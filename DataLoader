@@ -1,0 +1,92 @@
+from torch.utils.data import DataLoader
+from main import Food101Dataset, SVHNDataset
+from transform import get_train_transforms, get_test_transforms, get_ood_transforms
+from tqdm import tqdm
+import torch
+
+
+def Create_DataLoader(food101_root, svhn_root, batch_size = 64, num_workers = 1):
+
+    food101_train_dataset = Food101Dataset(food101_root, split ="train", transform=get_train_transforms())
+    #assegno i dataset separati
+    train_index, val_index = split_train_dataset(food101_train_dataset)
+
+    train_dataset = torch.utils.data.Subset(food101_train_dataset, train_index)
+
+    #important I use get_test_transform here, not train
+    food101_val_dataset = Food101Dataset(food101_root, split ="train", transform=get_test_transforms())
+    val_dataset = torch.utils.data.Subset(food101_val_dataset, val_index)
+
+    food101_test_dataset = Food101Dataset(food101_root, split ="test", transform=get_test_transforms())
+    shvn_test_dataset = SVHNDataset(svhn_root, split = "test", transform=get_ood_transforms())
+
+    train_loader = DataLoader(
+        train_dataset,  #load the train dataset
+        batch_size = batch_size, #define the batch_size
+        shuffle = True, #shuffle the data during the train
+        num_workers = num_workers, #define the number of parallel workers
+        pin_memory = True, #speed up if I use the GPU
+        drop_last = True #if the last batch of data is incomplete I discard it
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size = batch_size,
+        shuffle = False,
+        num_workers = num_workers,
+        pin_memory = True,
+        drop_last = False
+    )
+
+    test_loader = DataLoader(
+        food101_test_dataset,
+        batch_size = batch_size,
+        shuffle = False,
+        num_workers = num_workers,
+        pin_memory = True,
+        drop_last = False
+    )
+
+    ood_loader = DataLoader(
+        shvn_test_dataset,
+        batch_size = batch_size,
+        shuffle = False,
+        num_workers = num_workers,
+        pin_memory = True,
+        drop_last = False
+    )
+    return train_loader, val_loader, test_loader, ood_loader
+
+#split the train dataset to create a validation dataset.
+
+def split_train_dataset(dataset, validation_split=0.1):
+    # Show a bar while collecting labels
+    print("Analysis of classes in the dataset...")
+    class_indices = {}
+
+    for i in tqdm(range(len(dataset)), desc="Raccolta etichette", unit="img"):
+        _, label = dataset[i]
+        if label not in class_indices:
+            class_indices[label] = []
+        class_indices[label].append(i)
+
+    # Create stratified indexes for train and validation.
+    train_indices = []
+    val_indices = []
+
+    # Show a progress bar for layering.
+    for label, indices in tqdm(class_indices.items(), desc="Class stratification", unit="classe"):
+        # Shuffle the indexes of this class
+        indices = torch.tensor(indices)[torch.randperm(len(indices))]
+
+        # Calculate the division point
+        split_idx = int(len(indices) * (1 - validation_split))
+
+        # Add indexes to the appropriate lists
+        train_indices.extend(indices[:split_idx].tolist())
+        val_indices.extend(indices[split_idx:].tolist())
+
+    print(
+        f"Stratification completed! Dataset divided into {len(train_indices)} training samples and {len(val_indices)} validation samples.")
+
+    return train_indices, val_indices
