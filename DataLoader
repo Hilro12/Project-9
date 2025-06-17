@@ -8,7 +8,7 @@ import torch
 def Create_DataLoader(food101_root, svhn_root, batch_size = 64, num_workers = 1):
 
     food101_train_dataset = Food101Dataset(food101_root, split ="train", transform=get_train_transforms())
-    #assegno i dataset separati
+    #I assign twi separate dataset
     train_index, val_index = split_train_dataset(food101_train_dataset)
 
     train_dataset = torch.utils.data.Subset(food101_train_dataset, train_index)
