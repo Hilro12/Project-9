@@ -99,9 +99,9 @@ The choice to extract features from the third block of ResNet50 (producing 1024-
 
 ## Dataset Information
 
-**Food-101:** Contains 101 food categories with approximately 75,000 training images and 25,000 test images. Each image shows a different food dish and serves as the normal distribution for training.
+**Food-101:** Contains 101 food categories with approximately 75,000 training images and 25,000 test images. Each image shows a different food dish and serves as the normal distribution for training. https://www.kaggle.com/datasets/dansbecker/food-101
 
-**SVHN:** Street View House Numbers dataset containing real-world images of house numbers. These images are fundamentally different from food images, making them ideal for testing out-of-distribution detection.
+**SVHN:** Street View House Numbers dataset containing real-world images of house numbers. These images are fundamentally different from food images, making them ideal for testing out-of-distribution detection. 
 
 **CIFAR-10:** Additional test dataset containing natural objects like cars, animals, and planes, used to validate that the method works beyond the specific food domain.
 
